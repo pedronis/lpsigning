@@ -149,6 +149,15 @@ func (b *KeypairMgrBackend) LoadByID(keyID string) (*asserts.ExtKeypairMgrLoaded
 	return loadedKey, nil
 }
 
+// LoadByCanonicalFingerprint loads a configured key by its canonical fingerprint.
+func (b *KeypairMgrBackend) LoadByCanonicalFingerprint(fingerprint string) (*asserts.ExtKeypairMgrLoadedKey, error) {
+	loadedKey := b.loadedKeysByHandle[fingerprint]
+	if loadedKey == nil {
+		return nil, &keyNotFoundError{msg: "missing key"}
+	}
+	return loadedKey, nil
+}
+
 type keyNotFoundError struct {
 	msg string
 }

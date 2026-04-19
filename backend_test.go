@@ -598,3 +598,46 @@ func (s *backendSuite) TestSignRejectsMismatchedResponsePublicKeyID(c *check.C) 
 	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
 	c.Assert(err, check.ErrorMatches, `cannot sign with lp-signing: service used unexpected key with id ".*", expected ".*"`)
 }
+
+func (s *backendSuite) TestLoadByCanonicalFingerprint(c *check.C) {
+	privKey, _ := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          "http://example.com",
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR0",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByCanonicalFingerprint("LPFPR0")
+	c.Assert(err, check.IsNil)
+	c.Check(loaded.Name, check.Equals, "LPFPR0")
+	c.Check(loaded.KeyHandle, check.Equals, "LPFPR0")
+	c.Check(loaded.PublicKey.ID(), check.Equals, accountKey.PublicKeyID())
+}
+
+func (s *backendSuite) TestLoadByCanonicalFingerprintMissingKey(c *check.C) {
+	privKey, _ := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          "http://example.com",
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR0",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	_, err = backend.LoadByCanonicalFingerprint("MISSING")
+	c.Assert(err, check.ErrorMatches, `missing key`)
+}
