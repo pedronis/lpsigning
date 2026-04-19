@@ -32,7 +32,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -325,12 +324,15 @@ func (s *backendSuite) TestSignDearmorsDetachedSignature(c *check.C) {
 
 	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
 	c.Assert(err, check.IsNil)
+	c.Check(loaded.Name, check.Equals, "LPFPR1")
+	c.Check(loaded.KeyHandle, check.Equals, "LPFPR1")
 	signed, err := backend.Sign(loaded.KeyHandle, []byte("content to sign"))
 	c.Assert(err, check.IsNil)
 
 	c.Check(signed, check.DeepEquals, raw)
 	c.Check(service.lastSignRequest.KeyType, check.Equals, lpSigningKeyTypeOpenPGP)
 	c.Check(service.lastSignRequest.Fingerprint, check.Equals, "LPFPR1")
+	c.Check(service.lastSignRequest.MessageName, check.Equals, lpSigningMessageName)
 	c.Check(service.lastSignRequest.Mode, check.Equals, lpSigningModeDetached)
 	decodedMessage, err := base64.StdEncoding.DecodeString(service.lastSignRequest.Message)
 	c.Assert(err, check.IsNil)
@@ -371,6 +373,10 @@ func (s *backendSuite) TestExternalKeypairManagerIntegration(c *check.C) {
 	pk, err := kmgr.Get(accountKey.PublicKeyID())
 	c.Assert(err, check.IsNil)
 	c.Check(pk.PublicKey().ID(), check.Equals, accountKey.PublicKeyID())
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	c.Check(loaded.Name, check.Equals, "LPFPR2")
+	c.Check(loaded.KeyHandle, check.Equals, "LPFPR2")
 
 	store := assertstest.NewStoreStack("trusted", nil)
 	brandAcct := assertstest.NewAccount(store, "brand", map[string]any{
@@ -415,7 +421,7 @@ func (s *backendSuite) TestExternalKeypairManagerIntegration(c *check.C) {
 	_, err = kmgr.List()
 	c.Assert(err, check.ErrorMatches, `cannot list keys in sign-only external keypair manager`)
 	c.Check(service.lastSignRequest.Fingerprint, check.Equals, "LPFPR2")
-	c.Check(strings.TrimSpace(service.lastSignRequest.MessageName), check.Not(check.Equals), "")
+	c.Check(service.lastSignRequest.MessageName, check.Equals, lpSigningMessageName)
 }
 
 func (s *backendSuite) TestSignAcceptsArmoredResponsePublicKey(c *check.C) {

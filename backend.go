@@ -43,6 +43,7 @@ import (
 const (
 	lpSigningKeyTypeOpenPGP = "OPENPGP"
 	lpSigningModeDetached   = "DETACHED"
+	lpSigningMessageName    = "(assertion digest)"
 )
 
 // Config describes how to connect to the Launchpad signing service.
@@ -58,14 +59,7 @@ type KeyConfig struct {
 	Fingerprint string
 }
 
-type configuredKey struct {
-	keyID       string
-	name        string
-	fingerprint string
-	publicKey   asserts.PublicKey
-}
-
-func newConfiguredKey(keyCfg KeyConfig) (*configuredKey, error) {
+func newLoadedKey(keyCfg KeyConfig) (*asserts.ExtKeypairMgrLoadedKey, error) {
 	if keyCfg.AccountKey == nil {
 		return nil, fmt.Errorf("cannot create lp-signing backend: missing account-key assertion")
 	}
@@ -79,15 +73,10 @@ func newConfiguredKey(keyCfg KeyConfig) (*configuredKey, error) {
 	if publicKey.ID() != keyCfg.AccountKey.PublicKeyID() {
 		return nil, fmt.Errorf("cannot create lp-signing backend: account-key body does not match public key id %q", keyCfg.AccountKey.PublicKeyID())
 	}
-	name := keyCfg.AccountKey.Name()
-	if name == "" {
-		name = keyCfg.AccountKey.PublicKeyID()
-	}
-	return &configuredKey{
-		keyID:       keyCfg.AccountKey.PublicKeyID(),
-		name:        name,
-		fingerprint: keyCfg.Fingerprint,
-		publicKey:   publicKey,
+	return &asserts.ExtKeypairMgrLoadedKey{
+		Name:      keyCfg.Fingerprint,
+		KeyHandle: keyCfg.Fingerprint,
+		PublicKey: publicKey,
 	}, nil
 }
 
@@ -102,8 +91,8 @@ type KeypairMgrBackend struct {
 	servicePublicKey *[32]byte
 	serviceSharedKey *[32]byte
 
-	keysByID     map[string]*configuredKey
-	keysByHandle map[string]*configuredKey
+	loadedKeysByID     map[string]*asserts.ExtKeypairMgrLoadedKey
+	loadedKeysByHandle map[string]*asserts.ExtKeypairMgrLoadedKey
 }
 
 // NewKeypairMgrBackend creates a sign-only lp-signing backend from constructor-supplied configuration.
@@ -120,30 +109,31 @@ func NewKeypairMgrBackend(cfg Config) (*KeypairMgrBackend, error) {
 		return nil, fmt.Errorf("cannot create lp-signing backend: no signing keys configured")
 	}
 
-	keysByID := make(map[string]*configuredKey, len(cfg.Keys))
-	keysByHandle := make(map[string]*configuredKey, len(cfg.Keys))
+	loadedKeysByID := make(map[string]*asserts.ExtKeypairMgrLoadedKey, len(cfg.Keys))
+	loadedKeysByHandle := make(map[string]*asserts.ExtKeypairMgrLoadedKey, len(cfg.Keys))
 	for _, keyCfg := range cfg.Keys {
-		configured, err := newConfiguredKey(keyCfg)
+		loadedKey, err := newLoadedKey(keyCfg)
 		if err != nil {
 			return nil, err
 		}
-		if _, found := keysByID[configured.keyID]; found {
-			return nil, fmt.Errorf("cannot create lp-signing backend: duplicate key id %q", configured.keyID)
+		keyID := loadedKey.PublicKey.ID()
+		if _, found := loadedKeysByID[keyID]; found {
+			return nil, fmt.Errorf("cannot create lp-signing backend: duplicate key id %q", keyID)
 		}
-		if _, found := keysByHandle[configured.fingerprint]; found {
-			return nil, fmt.Errorf("cannot create lp-signing backend: duplicate fingerprint %q", configured.fingerprint)
+		if _, found := loadedKeysByHandle[loadedKey.KeyHandle]; found {
+			return nil, fmt.Errorf("cannot create lp-signing backend: duplicate fingerprint %q", loadedKey.KeyHandle)
 		}
-		keysByID[configured.keyID] = configured
-		keysByHandle[configured.fingerprint] = configured
+		loadedKeysByID[keyID] = loadedKey
+		loadedKeysByHandle[loadedKey.KeyHandle] = loadedKey
 	}
 
 	return &KeypairMgrBackend{
-		baseURL:          baseURL,
-		httpClient:       http.DefaultClient,
-		clientPublicKey:  clientPublicKey,
-		clientPrivateKey: clientPrivateKey,
-		keysByID:         keysByID,
-		keysByHandle:     keysByHandle,
+		baseURL:            baseURL,
+		httpClient:         http.DefaultClient,
+		clientPublicKey:    clientPublicKey,
+		clientPrivateKey:   clientPrivateKey,
+		loadedKeysByID:     loadedKeysByID,
+		loadedKeysByHandle: loadedKeysByHandle,
 	}, nil
 }
 
@@ -152,15 +142,11 @@ func (b *KeypairMgrBackend) CheckFeatures() (asserts.ExtKeypairMgrSigning, error
 }
 
 func (b *KeypairMgrBackend) LoadByID(keyID string) (*asserts.ExtKeypairMgrLoadedKey, error) {
-	configured := b.keysByID[keyID]
-	if configured == nil {
+	loadedKey := b.loadedKeysByID[keyID]
+	if loadedKey == nil {
 		return nil, &keyNotFoundError{msg: "missing key"}
 	}
-	return &asserts.ExtKeypairMgrLoadedKey{
-		Name:      configured.name,
-		KeyHandle: configured.fingerprint,
-		PublicKey: configured.publicKey,
-	}, nil
+	return loadedKey, nil
 }
 
 type keyNotFoundError struct {
@@ -176,17 +162,17 @@ func (b *KeypairMgrBackend) RSAPKCSSign(keyHandle string, prepared []byte) ([]by
 }
 
 func (b *KeypairMgrBackend) Sign(keyHandle string, content []byte) ([]byte, error) {
-	configured := b.keysByHandle[keyHandle]
-	if configured == nil {
+	loadedKey := b.loadedKeysByHandle[keyHandle]
+	if loadedKey == nil {
 		return nil, &keyNotFoundError{msg: "missing key"}
 	}
 
-	signedMessage, decodedPublicKey, err := b.signDetached(configured, content)
+	signedMessage, decodedPublicKey, err := b.signDetached(loadedKey, content)
 	if err != nil {
 		return nil, err
 	}
-	if decodedPublicKey.ID() != configured.keyID {
-		return nil, fmt.Errorf("cannot sign with lp-signing: service used unexpected key with id %q, expected %q", decodedPublicKey.ID(), configured.keyID)
+	if decodedPublicKey.ID() != loadedKey.PublicKey.ID() {
+		return nil, fmt.Errorf("cannot sign with lp-signing: service used unexpected key with id %q, expected %q", decodedPublicKey.ID(), loadedKey.PublicKey.ID())
 	}
 	return decodeArmoredSignature(signedMessage)
 }
@@ -212,11 +198,11 @@ type lpSigningNonceResponse struct {
 	Nonce string `json:"nonce"`
 }
 
-func (b *KeypairMgrBackend) signDetached(configured *configuredKey, content []byte) ([]byte, asserts.PublicKey, error) {
+func (b *KeypairMgrBackend) signDetached(loadedKey *asserts.ExtKeypairMgrLoadedKey, content []byte) ([]byte, asserts.PublicKey, error) {
 	responseBody, err := b.boxedPost("/sign", lpSigningSignRequest{
 		KeyType:     lpSigningKeyTypeOpenPGP,
-		Fingerprint: configured.fingerprint,
-		MessageName: configured.name,
+		Fingerprint: loadedKey.KeyHandle,
+		MessageName: lpSigningMessageName,
 		Message:     base64.StdEncoding.EncodeToString(content),
 		Mode:        lpSigningModeDetached,
 	})
