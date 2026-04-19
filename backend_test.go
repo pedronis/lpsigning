@@ -23,6 +23,8 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -50,14 +52,16 @@ type backendSuite struct{}
 var _ = check.Suite(&backendSuite{})
 
 type mockSigningService struct {
-	servicePublicKey  *[32]byte
-	servicePrivateKey *[32]byte
-	lastSignRequest   lpSigningSignRequest
-	armoredSignature  []byte
-	signingKey        *rsa.PrivateKey
-	responsePublicKey []byte
-	errorMessage      string
-	nonceValue        [24]byte
+	servicePublicKey        *[32]byte
+	servicePrivateKey       *[32]byte
+	lastSignRequest         lpSigningSignRequest
+	armoredSignature        []byte
+	signingKey              *rsa.PrivateKey
+	responsePublicKey       []byte
+	responsePublicKeyBase64 string
+	omitPublicKey           bool
+	errorMessage            string
+	nonceValue              [24]byte
 }
 
 func newMockSigningService(c *check.C, armoredSignature []byte, responsePublicKey []byte) *mockSigningService {
@@ -129,10 +133,17 @@ func (s *mockSigningService) handleSign(w http.ResponseWriter, r *http.Request) 
 				return
 			}
 		}
-		responseBody, _ = json.Marshal(map[string]string{
+		response := map[string]string{
 			"signed-message": base64.StdEncoding.EncodeToString(armoredSignature),
-			"public-key":     base64.StdEncoding.EncodeToString(s.responsePublicKey),
-		})
+		}
+		if !s.omitPublicKey {
+			publicKey := s.responsePublicKeyBase64
+			if publicKey == "" {
+				publicKey = base64.StdEncoding.EncodeToString(s.responsePublicKey)
+			}
+			response["public-key"] = publicKey
+		}
+		responseBody, _ = json.Marshal(response)
 	}
 
 	boxed := box.Seal(nil, responseBody, responseNonce, clientPublicKey, s.servicePrivateKey)
@@ -199,6 +210,60 @@ func makeArmoredDetachedSignatureBytes(privateKey *rsa.PrivateKey, content []byt
 	return armored.Bytes(), raw.Bytes(), nil
 }
 
+func makeOpenPGPRSAPublicKeyBytes(publicKey *rsa.PublicKey) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+	if err := packet.NewRSAPublicKey(time.Unix(1, 0), publicKey).Serialize(buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func makeArmoredOpenPGPRSAPublicKeyBytes(publicKey *rsa.PublicKey) ([]byte, error) {
+	rawPublicKey, err := makeOpenPGPRSAPublicKeyBytes(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	buf := bytes.NewBuffer(nil)
+	armorWriter, err := armor.Encode(buf, "PGP PUBLIC KEY BLOCK", nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := armorWriter.Write(rawPublicKey); err != nil {
+		return nil, err
+	}
+	if err := armorWriter.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func makeArmoredOpenPGPECDSAPublicKeyBytes(publicKey *ecdsa.PublicKey) ([]byte, error) {
+	rawPublicKey, err := makeOpenPGPECDSAPublicKeyBytes(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	buf := bytes.NewBuffer(nil)
+	armorWriter, err := armor.Encode(buf, "PGP PUBLIC KEY BLOCK", nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := armorWriter.Write(rawPublicKey); err != nil {
+		return nil, err
+	}
+	if err := armorWriter.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func makeOpenPGPECDSAPublicKeyBytes(publicKey *ecdsa.PublicKey) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+	if err := packet.NewECDSAPublicKey(time.Unix(1, 0), publicKey).Serialize(buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 func makeAccountKey(c *check.C, pubKey asserts.PublicKey) *asserts.AccountKey {
 	store := assertstest.NewStoreStack("trusted", nil)
 	brandAcct := assertstest.NewAccount(store, "brand", map[string]any{
@@ -239,7 +304,9 @@ func (s *backendSuite) TestSignDearmorsDetachedSignature(c *check.C) {
 	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
 	accountKey := makeAccountKey(c, privKey.PublicKey())
 	armored, raw := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
-	service := newMockSigningService(c, armored, accountKey.Body())
+	servicePublicKey, err := makeArmoredOpenPGPRSAPublicKeyBytes(&rsaPrivKey.PublicKey)
+	c.Assert(err, check.IsNil)
+	service := newMockSigningService(c, armored, servicePublicKey)
 	server := httptest.NewServer(service.handler())
 	defer server.Close()
 
@@ -275,7 +342,9 @@ func (s *backendSuite) TestSignDearmorsDetachedSignature(c *check.C) {
 func (s *backendSuite) TestExternalKeypairManagerIntegration(c *check.C) {
 	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
 	accountKey := makeAccountKey(c, privKey.PublicKey())
-	service := newMockSigningService(c, nil, accountKey.Body())
+	servicePublicKey, err := makeArmoredOpenPGPRSAPublicKeyBytes(&rsaPrivKey.PublicKey)
+	c.Assert(err, check.IsNil)
+	service := newMockSigningService(c, nil, servicePublicKey)
 	service.signingKey = rsaPrivKey
 	server := httptest.NewServer(service.handler())
 	defer server.Close()
@@ -347,4 +416,179 @@ func (s *backendSuite) TestExternalKeypairManagerIntegration(c *check.C) {
 	c.Assert(err, check.ErrorMatches, `cannot list keys in sign-only external keypair manager`)
 	c.Check(service.lastSignRequest.Fingerprint, check.Equals, "LPFPR2")
 	c.Check(strings.TrimSpace(service.lastSignRequest.MessageName), check.Not(check.Equals), "")
+}
+
+func (s *backendSuite) TestSignAcceptsArmoredResponsePublicKey(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armoredSignature, rawSignature := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	servicePublicKey, err := makeArmoredOpenPGPRSAPublicKeyBytes(&rsaPrivKey.PublicKey)
+	c.Assert(err, check.IsNil)
+	service := newMockSigningService(c, armoredSignature, servicePublicKey)
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR2A",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	signed, err := backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.IsNil)
+	c.Check(signed, check.DeepEquals, rawSignature)
+}
+
+func (s *backendSuite) TestSignRejectsMissingResponsePublicKey(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armored, _ := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	service := newMockSigningService(c, armored, nil)
+	service.omitPublicKey = true
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR3",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.ErrorMatches, `cannot decode lp-signing sign response: missing public-key`)
+}
+
+func (s *backendSuite) TestSignRejectsInvalidResponsePublicKeyBase64(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armored, _ := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	service := newMockSigningService(c, armored, nil)
+	service.responsePublicKeyBase64 = "%"
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR4",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.ErrorMatches, `cannot decode lp-signing sign response public key: illegal base64 data at input byte 0`)
+}
+
+func (s *backendSuite) TestSignRejectsInvalidOpenPGPResponsePublicKey(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armored, _ := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	service := newMockSigningService(c, armored, []byte("not an openpgp public key"))
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR5",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.ErrorMatches, `cannot decode lp-signing sign response public key: .*`)
+}
+
+func (s *backendSuite) TestSignRejectsNonRSAResponsePublicKey(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armored, _ := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	ecdsaPrivateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	c.Assert(err, check.IsNil)
+	servicePublicKey, err := makeArmoredOpenPGPECDSAPublicKeyBytes(&ecdsaPrivateKey.PublicKey)
+	c.Assert(err, check.IsNil)
+	service := newMockSigningService(c, armored, servicePublicKey)
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR6",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.ErrorMatches, `cannot decode lp-signing sign response public key: unsupported OpenPGP public key type \*ecdsa.PublicKey`)
+}
+
+func (s *backendSuite) TestSignRejectsMismatchedResponsePublicKeyID(c *check.C) {
+	privKey, rsaPrivKey := assertstest.ReadPrivKey(assertstest.DevKey)
+	accountKey := makeAccountKey(c, privKey.PublicKey())
+	armored, _ := makeArmoredDetachedSignature(c, rsaPrivKey, []byte("content to sign"))
+	mismatchedPrivateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	c.Assert(err, check.IsNil)
+	servicePublicKey, err := makeArmoredOpenPGPRSAPublicKeyBytes(&mismatchedPrivateKey.PublicKey)
+	c.Assert(err, check.IsNil)
+	service := newMockSigningService(c, armored, servicePublicKey)
+	server := httptest.NewServer(service.handler())
+	defer server.Close()
+
+	_, clientPrivateKey, err := generateX25519Keypair(rand.Reader)
+	c.Assert(err, check.IsNil)
+
+	backend, err := NewKeypairMgrBackend(Config{
+		BaseURL:          server.URL,
+		ClientPrivateKey: base64.StdEncoding.EncodeToString(clientPrivateKey[:]),
+		Keys: []KeyConfig{{
+			AccountKey:  accountKey,
+			Fingerprint: "LPFPR7",
+		}},
+	})
+	c.Assert(err, check.IsNil)
+
+	loaded, err := backend.LoadByID(accountKey.PublicKeyID())
+	c.Assert(err, check.IsNil)
+	_, err = backend.Sign(loaded.KeyHandle, []byte("content to sign"))
+	c.Assert(err, check.ErrorMatches, `cannot sign with lp-signing: service used unexpected key with id ".*", expected ".*"`)
 }

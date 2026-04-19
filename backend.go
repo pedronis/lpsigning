@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -34,6 +35,7 @@ import (
 
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/openpgp/armor"
+	"golang.org/x/crypto/openpgp/packet"
 
 	"github.com/snapcore/snapd/asserts"
 )
@@ -145,9 +147,12 @@ func (b *KeypairMgrBackend) Sign(keyHandle string, content []byte) ([]byte, erro
 		return nil, &keyNotFoundError{msg: "missing key"}
 	}
 
-	signedMessage, _, err := b.signDetached(configured, content)
+	signedMessage, decodedPublicKey, err := b.signDetached(configured, content)
 	if err != nil {
 		return nil, err
+	}
+	if decodedPublicKey.ID() != configured.keyID {
+		return nil, fmt.Errorf("cannot sign with lp-signing: service used unexpected key with id %q, expected %q", decodedPublicKey.ID(), configured.keyID)
 	}
 	return decodeArmoredSignature(signedMessage)
 }
@@ -173,7 +178,7 @@ type lpSigningNonceResponse struct {
 	Nonce string `json:"nonce"`
 }
 
-func (b *KeypairMgrBackend) signDetached(configured *configuredKey, content []byte) ([]byte, []byte, error) {
+func (b *KeypairMgrBackend) signDetached(configured *configuredKey, content []byte) ([]byte, asserts.PublicKey, error) {
 	responseBody, err := b.boxedPost("/sign", lpSigningSignRequest{
 		KeyType:     lpSigningKeyTypeOpenPGP,
 		Fingerprint: configured.fingerprint,
@@ -196,14 +201,47 @@ func (b *KeypairMgrBackend) signDetached(configured *configuredKey, content []by
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot decode lp-signing sign response: %v", err)
 	}
-	var publicKey []byte
-	if response.PublicKey != "" {
-		publicKey, err = base64.StdEncoding.DecodeString(response.PublicKey)
-		if err != nil {
-			return nil, nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
-		}
+	if response.PublicKey == "" {
+		return nil, nil, fmt.Errorf("cannot decode lp-signing sign response: missing public-key")
 	}
-	return signedMessage, publicKey, nil
+	armoredPublicKey, err := base64.StdEncoding.DecodeString(response.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
+	}
+	decodedPublicKey, err := decodeLPSignignArmoredOpenPGPPublicKey(armoredPublicKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return signedMessage, decodedPublicKey, nil
+}
+
+func decodeLPSignignArmoredOpenPGPPublicKey(armoredPublicKey []byte) (asserts.PublicKey, error) {
+	block, err := armor.Decode(bytes.NewReader(armoredPublicKey))
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
+	}
+	if block.Type != "PGP PUBLIC KEY BLOCK" {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: unexpected block type %q", block.Type)
+	}
+	decodedPublicKey, err := io.ReadAll(block.Body)
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
+	}
+
+	packetReader := packet.NewReader(bytes.NewReader(decodedPublicKey))
+	pkt, err := packetReader.Next()
+	if err != nil {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
+	}
+	pgpPublicKey, ok := pkt.(*packet.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: unexpected OpenPGP packet %T", pkt)
+	}
+	rsaPublicKey, ok := pgpPublicKey.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: unsupported OpenPGP public key type %T", pgpPublicKey.PublicKey)
+	}
+	return asserts.RSAPublicKey(rsaPublicKey), nil
 }
 
 func normalizeBaseURL(rawBaseURL string) (string, error) {
