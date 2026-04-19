@@ -65,6 +65,32 @@ type configuredKey struct {
 	publicKey   asserts.PublicKey
 }
 
+func newConfiguredKey(keyCfg KeyConfig) (*configuredKey, error) {
+	if keyCfg.AccountKey == nil {
+		return nil, fmt.Errorf("cannot create lp-signing backend: missing account-key assertion")
+	}
+	if keyCfg.Fingerprint == "" {
+		return nil, fmt.Errorf("cannot create lp-signing backend: missing fingerprint for account-key %q", keyCfg.AccountKey.PublicKeyID())
+	}
+	publicKey, err := asserts.DecodePublicKey(keyCfg.AccountKey.Body())
+	if err != nil {
+		return nil, fmt.Errorf("cannot create lp-signing backend: cannot decode account-key public key %q: %v", keyCfg.AccountKey.PublicKeyID(), err)
+	}
+	if publicKey.ID() != keyCfg.AccountKey.PublicKeyID() {
+		return nil, fmt.Errorf("cannot create lp-signing backend: account-key body does not match public key id %q", keyCfg.AccountKey.PublicKeyID())
+	}
+	name := keyCfg.AccountKey.Name()
+	if name == "" {
+		name = keyCfg.AccountKey.PublicKeyID()
+	}
+	return &configuredKey{
+		keyID:       keyCfg.AccountKey.PublicKeyID(),
+		name:        name,
+		fingerprint: keyCfg.Fingerprint,
+		publicKey:   publicKey,
+	}, nil
+}
+
 // KeypairMgrBackend is a sign-only asserts external keypair manager backend backed by lp-signing.
 type KeypairMgrBackend struct {
 	baseURL          string
@@ -135,6 +161,14 @@ func (b *KeypairMgrBackend) LoadByID(keyID string) (*asserts.ExtKeypairMgrLoaded
 		KeyHandle: configured.fingerprint,
 		PublicKey: configured.publicKey,
 	}, nil
+}
+
+type keyNotFoundError struct {
+	msg string
+}
+
+func (e *keyNotFoundError) Error() string {
+	return e.msg
 }
 
 func (b *KeypairMgrBackend) RSAPKCSSign(keyHandle string, prepared []byte) ([]byte, error) {
@@ -208,14 +242,14 @@ func (b *KeypairMgrBackend) signDetached(configured *configuredKey, content []by
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
 	}
-	decodedPublicKey, err := decodeLPSignignArmoredOpenPGPPublicKey(armoredPublicKey)
+	decodedPublicKey, err := decodeArmoredPublicKey(armoredPublicKey)
 	if err != nil {
 		return nil, nil, err
 	}
 	return signedMessage, decodedPublicKey, nil
 }
 
-func decodeLPSignignArmoredOpenPGPPublicKey(armoredPublicKey []byte) (asserts.PublicKey, error) {
+func decodeArmoredPublicKey(armoredPublicKey []byte) (asserts.PublicKey, error) {
 	block, err := armor.Decode(bytes.NewReader(armoredPublicKey))
 	if err != nil {
 		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: %v", err)
@@ -242,79 +276,6 @@ func decodeLPSignignArmoredOpenPGPPublicKey(armoredPublicKey []byte) (asserts.Pu
 		return nil, fmt.Errorf("cannot decode lp-signing sign response public key: unsupported OpenPGP public key type %T", pgpPublicKey.PublicKey)
 	}
 	return asserts.RSAPublicKey(rsaPublicKey), nil
-}
-
-func normalizeBaseURL(rawBaseURL string) (string, error) {
-	if rawBaseURL == "" {
-		return "", fmt.Errorf("cannot create lp-signing backend: missing base URL")
-	}
-	parsed, err := url.Parse(rawBaseURL)
-	if err != nil {
-		return "", fmt.Errorf("cannot create lp-signing backend: invalid base URL: %v", err)
-	}
-	if parsed.Scheme == "" || parsed.Host == "" {
-		return "", fmt.Errorf("cannot create lp-signing backend: invalid base URL %q", rawBaseURL)
-	}
-	return strings.TrimRight(parsed.String(), "/"), nil
-}
-
-func decodeClientPrivateKey(encoded string) ([32]byte, [32]byte, error) {
-	var privateKey [32]byte
-	var publicKey [32]byte
-	if encoded == "" {
-		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: missing client private key")
-	}
-	decoded, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: cannot decode client private key: %v", err)
-	}
-	if len(decoded) != len(privateKey) {
-		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: client private key must be %d bytes, got %d", len(privateKey), len(decoded))
-	}
-	copy(privateKey[:], decoded)
-	derivedPublicKey, err := x25519PublicKey(privateKey)
-	if err != nil {
-		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: cannot derive client public key: %v", err)
-	}
-	publicKey = derivedPublicKey
-	return privateKey, publicKey, nil
-}
-
-func x25519PublicKey(privateKey [32]byte) ([32]byte, error) {
-	curve := ecdh.X25519()
-	priv, err := curve.NewPrivateKey(privateKey[:])
-	if err != nil {
-		return [32]byte{}, err
-	}
-	var publicKey [32]byte
-	copy(publicKey[:], priv.PublicKey().Bytes())
-	return publicKey, nil
-}
-
-func newConfiguredKey(keyCfg KeyConfig) (*configuredKey, error) {
-	if keyCfg.AccountKey == nil {
-		return nil, fmt.Errorf("cannot create lp-signing backend: missing account-key assertion")
-	}
-	if keyCfg.Fingerprint == "" {
-		return nil, fmt.Errorf("cannot create lp-signing backend: missing fingerprint for account-key %q", keyCfg.AccountKey.PublicKeyID())
-	}
-	publicKey, err := asserts.DecodePublicKey(keyCfg.AccountKey.Body())
-	if err != nil {
-		return nil, fmt.Errorf("cannot create lp-signing backend: cannot decode account-key public key %q: %v", keyCfg.AccountKey.PublicKeyID(), err)
-	}
-	if publicKey.ID() != keyCfg.AccountKey.PublicKeyID() {
-		return nil, fmt.Errorf("cannot create lp-signing backend: account-key body does not match public key id %q", keyCfg.AccountKey.PublicKeyID())
-	}
-	name := keyCfg.AccountKey.Name()
-	if name == "" {
-		name = keyCfg.AccountKey.PublicKeyID()
-	}
-	return &configuredKey{
-		keyID:       keyCfg.AccountKey.PublicKeyID(),
-		name:        name,
-		fingerprint: keyCfg.Fingerprint,
-		publicKey:   publicKey,
-	}, nil
 }
 
 func decodeArmoredSignature(armoredSignature []byte) ([]byte, error) {
@@ -383,18 +344,6 @@ func (b *KeypairMgrBackend) boxedPost(path string, payload any) ([]byte, error) 
 	return plaintextResponse, nil
 }
 
-func decodeAPIError(path string, plaintextResponse []byte, statusCode int) error {
-	var apiErr struct {
-		ErrorList []struct {
-			Message string `json:"message"`
-		} `json:"error_list"`
-	}
-	if err := json.Unmarshal(plaintextResponse, &apiErr); err == nil && len(apiErr.ErrorList) > 0 && apiErr.ErrorList[0].Message != "" {
-		return fmt.Errorf("cannot call lp-signing %s: %s", path, apiErr.ErrorList[0].Message)
-	}
-	return fmt.Errorf("cannot call lp-signing %s: unexpected status %d", path, statusCode)
-}
-
 func (b *KeypairMgrBackend) getServiceSharedKey() (*[32]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -461,13 +410,52 @@ func (b *KeypairMgrBackend) getNonce() (*[24]byte, error) {
 	copy(nonce[:], decoded)
 	return nonce, nil
 }
-
-func randomNonce() (*[24]byte, error) {
-	responseNonce := new([24]byte)
-	if _, err := rand.Read(responseNonce[:]); err != nil {
-		return nil, fmt.Errorf("cannot generate lp-signing response nonce: %v", err)
+func decodeAPIError(path string, plaintextResponse []byte, statusCode int) error {
+	var apiErr struct {
+		ErrorList []struct {
+			Message string `json:"message"`
+		} `json:"error_list"`
 	}
-	return responseNonce, nil
+	if err := json.Unmarshal(plaintextResponse, &apiErr); err == nil && len(apiErr.ErrorList) > 0 && apiErr.ErrorList[0].Message != "" {
+		return fmt.Errorf("cannot call lp-signing %s: %s", path, apiErr.ErrorList[0].Message)
+	}
+	return fmt.Errorf("cannot call lp-signing %s: unexpected status %d", path, statusCode)
+}
+
+func normalizeBaseURL(rawBaseURL string) (string, error) {
+	if rawBaseURL == "" {
+		return "", fmt.Errorf("cannot create lp-signing backend: missing base URL")
+	}
+	parsed, err := url.Parse(rawBaseURL)
+	if err != nil {
+		return "", fmt.Errorf("cannot create lp-signing backend: invalid base URL: %v", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("cannot create lp-signing backend: invalid base URL %q", rawBaseURL)
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func decodeClientPrivateKey(encoded string) ([32]byte, [32]byte, error) {
+	var privateKey [32]byte
+	var publicKey [32]byte
+	if encoded == "" {
+		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: missing client private key")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: cannot decode client private key: %v", err)
+	}
+	if len(decoded) != len(privateKey) {
+		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: client private key must be %d bytes, got %d", len(privateKey), len(decoded))
+	}
+	copy(privateKey[:], decoded)
+	derivedPublicKey, err := x25519PublicKey(privateKey)
+	if err != nil {
+		return privateKey, publicKey, fmt.Errorf("cannot create lp-signing backend: cannot derive client public key: %v", err)
+	}
+	publicKey = derivedPublicKey
+	return privateKey, publicKey, nil
 }
 
 func sealBox(message []byte, nonce *[24]byte, sharedKey *[32]byte) []byte {
@@ -478,10 +466,21 @@ func openBox(boxed []byte, nonce *[24]byte, sharedKey *[32]byte) ([]byte, bool) 
 	return box.OpenAfterPrecomputation(nil, boxed, nonce, sharedKey)
 }
 
-type keyNotFoundError struct {
-	msg string
+func x25519PublicKey(privateKey [32]byte) ([32]byte, error) {
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privateKey[:])
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var publicKey [32]byte
+	copy(publicKey[:], priv.PublicKey().Bytes())
+	return publicKey, nil
 }
 
-func (e *keyNotFoundError) Error() string {
-	return e.msg
+func randomNonce() (*[24]byte, error) {
+	responseNonce := new([24]byte)
+	if _, err := rand.Read(responseNonce[:]); err != nil {
+		return nil, fmt.Errorf("cannot generate lp-signing response nonce: %v", err)
+	}
+	return responseNonce, nil
 }
