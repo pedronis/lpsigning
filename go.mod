@@ -3,7 +3,7 @@ module github.com/pedronis/lpsigning
 go 1.18
 
 require (
-	github.com/snapcore/snapd v0.0.0
+	github.com/snapcore/snapd v0.0.0-20260622141614-e04020157e05
 	golang.org/x/crypto v0.23.0
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c
 )
@@ -19,5 +19,3 @@ require (
 	gopkg.in/tomb.v2 v2.0.0-20161208151619-d5d1b5820637 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
-
-replace github.com/snapcore/snapd => github.com/pedronis/snappy v0.0.0-20260418203206-3020a5173862
